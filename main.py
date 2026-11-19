@@ -166,39 +166,49 @@ def refresh_steps(reads):
 
 
 def forecast_pool(ts, ns, t_target, horizon_h):
-    """Ensemble median of N(target) and a log-scale spread."""
-    n_last = ns[-1]
-    fams = []
+    """Ensemble median of N(target) and a log-scale spread.
+
+    Curve families (logistic, Gompertz, power, linear) capture saturation when the
+    history is long enough to identify it; a damped-trend continuation built from the
+    recent log-growth rate stays honest when refresh steps are few and a sigmoid would
+    lock its ceiling onto the last observation. The spread carries the disagreement.
+    """
+    n_last = float(ns[-1])
+    t_last = ts[-1]
+    k = min(3, len(ts))
+    if k >= 2 and ts[-1] > ts[-k]:
+        g = (math.log(ns[-1]) - math.log(ns[-k])) / (ts[-1] - ts[-k])
+    else:
+        g = 0.0
+    g = max(g, 0.0)
+    dt = max(t_target - t_last, 0.0)
+    # a minimal continuation floor: growth may decelerate, but the pool does not shrink
+    floor = math.log(n_last) + g * dt * 0.10
+    scenarios = []  # (logN_target, weight)
     for fitter in (fit_logistic, fit_gompertz, fit_power, fit_linear):
         try:
             f, v = fitter(ts, ns)
-            fams.append((f, v))
-        except Exception:
-            pass
-    preds = []
-    for f, v in fams:
-        try:
             np_ = f(t_target)
         except Exception:
             continue
-        if not math.isfinite(np_):
+        if not math.isfinite(np_) or np_ < n_last:
             continue
-        # monotone growth: a family may not predict the pool shrinking
-        preds.append((max(np_, n_last), v))
-    if not preds:
-        return float(n_last), 0.4
-    # weight by fit quality on log N (linear's raw-N loss rescaled to log scale)
-    logs = [math.log(p) for p, _ in preds]
-    losses = []
-    for (p, v), lg in zip(preds, logs):
-        # normalise each family's loss to a per-point log misfit
-        losses.append(v / max(len(ts), 1))
-    lmin = min(losses)
-    weights = [math.exp(-(l - lmin) / 0.15) for l in losses]
+        lg = math.log(np_)
+        # distrust a curve that saturates far below the continuation floor
+        w = math.exp(-(v / max(len(ts), 1)) / 0.15)
+        if lg < floor:
+            w *= 0.15
+        scenarios.append((lg, w))
+    for tau in (24.0, 60.0, 120.0):
+        lg = math.log(n_last) + g * tau * (1.0 - math.exp(-dt / tau))
+        scenarios.append((max(lg, math.log(n_last)), 1.0))
+    if not scenarios:
+        return n_last, 0.4
+    logs = [lg for lg, _ in scenarios]
+    weights = [w for _, w in scenarios]
     wsum = sum(weights)
     logN = sum(w * lg for w, lg in zip(weights, logs)) / wsum
     N_med = math.exp(logN)
-    # spread: family disagreement + horizon widening
     disp = max(logs) - min(logs)
     sig = max(0.30, 0.55 * disp) + 0.12 * math.sqrt(max(horizon_h, 0.0) / 24.0)
     return N_med, sig
